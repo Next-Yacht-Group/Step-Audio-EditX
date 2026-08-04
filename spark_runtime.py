@@ -92,13 +92,35 @@ def install_audio_compat() -> None:
     logger.info("🔧 torchaudio load/save routed through soundfile (Spark)")
 
 
+def disable_cudnn() -> None:
+    """Take cuDNN out of the picture, it cannot run this vocoder here.
+
+    cuDNN 9.21 on the GB10 has no engine for the `ConvTranspose1d` the HiFT
+    vocoder upsamples with — float32, bfloat16 and float16 all raise "GET was
+    unable to find an engine to execute this computation" — so every generation
+    dies after the LLM has already done its work. PyTorch's own CUDA kernels run
+    it fine, and nothing in this pipeline is big enough for the loss of cuDNN's
+    tuned convolutions to matter next to the vLLM pass.
+    """
+    if not torch.backends.cudnn.enabled:
+        return
+    torch.backends.cudnn.enabled = False
+    logger.info("🔧 cuDNN disabled, no ConvTranspose1d engine on this GPU (Spark)")
+
+
+def install_compat() -> None:
+    """Every workaround this box needs, in the order they must be applied."""
+    install_audio_compat()
+    disable_cudnn()
+
+
 def create_engine(
     model_path: str = MODEL_PATH,
     tokenizer_path: str = TOKENIZER_PATH,
     **overrides,
 ) -> StepAudioTTS:
     """Load the tokenizer + TTS engine with the Spark settings applied."""
-    install_audio_compat()
+    install_compat()
     kwargs = {**ENGINE_KWARGS, **overrides}
     tokenizer = StepAudioTokenizer(tokenizer_path, model_source=kwargs["model_source"])
     return StepAudioTTS(model_path, tokenizer, **kwargs)

@@ -884,15 +884,33 @@ perché nella configurazione vLLM usata è stata ignorata.
 
 ### CosyVoice: `GET was unable to find an engine`
 
-Errore osservato:
+Errore osservato, al termine della generazione (l'LLM ha già prodotto i token):
 
 ```text
-Loading CosyVoice with dtype=float32, cuda_graph=True
-CUDA Graph initialized successfully for chunk decoder
-GET was unable to find an engine to execute this computation
+File ".../stepvocoder/cosyvoice2/hifigan/generator.py", line 547, in decode_without_stft
+  x = self.ups[i](x)
+File ".../torch/nn/modules/conv.py", line 988, in forward
+RuntimeError: GET was unable to find an engine to execute this computation
 ```
 
-Soluzione:
+Causa reale: **cuDNN 9.21 non ha un engine per la `ConvTranspose1d` con cui il
+vocoder HiFT fa upsampling su GB10.** Non dipende dai CUDA Graph né dal dtype —
+si riproduce in isolamento con float32, bfloat16 e float16:
+
+```bash
+docker run --rm --gpus all step-audio-editx:spark python3 -c '
+import torch
+m = torch.nn.ConvTranspose1d(512, 256, 16, 8, padding=4).cuda()
+x = torch.randn(1, 512, 200, device=0)
+torch.backends.cudnn.enabled = False   # togli questa riga per vedere l\''errore
+print(m(x).shape)'
+```
+
+Soluzione (già nel repository): `spark_runtime.disable_cudnn()` disattiva cuDNN,
+e i kernel CUDA nativi di PyTorch eseguono la stessa convoluzione senza problemi.
+Il costo è trascurabile: qui le convoluzioni sono piccole rispetto al passo vLLM.
+
+Restano comunque consigliati, per i motivi al §12:
 
 ```text
 --cosyvoice-dtype float32
