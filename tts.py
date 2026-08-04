@@ -50,7 +50,8 @@ class StepAudioTTS:
         max_num_seqs=None,
         max_num_batched_tokens=None,
         cosyvoice_dtype="float32",
-        cosyvoice_cuda_graph=True
+        cosyvoice_cuda_graph=True,
+        max_new_tokens=None
     ):
         """
         Initialize StepAudioTTS with vLLM
@@ -71,9 +72,16 @@ class StepAudioTTS:
             max_num_batched_tokens: Max tokens per batch (lower = less activation memory)
             cosyvoice_dtype: CosyVoice vocoder dtype ('float32', 'bfloat16', 'float16')
             cosyvoice_cuda_graph: Enable CUDA Graph for CosyVoice (default: True)
+            max_new_tokens: Ceiling on generated tokens (default: None, the whole
+                context). Worth setting for short target texts: the model
+                sometimes carries on well past them, and a bulk caller would
+                rather see a truncated take it can reject cheaply than pay for a
+                full-context generation of speech it is going to throw away.
+                Audio runs at roughly 42 tokens per second.
         """
         if tts_model_id is None:
             tts_model_id = model_path
+        self.max_new_tokens = max_new_tokens
 
         logger.info("🔧 StepAudioTTS loading configuration:")
         logger.info(f"   - model_source: {model_source}")
@@ -160,7 +168,7 @@ class StepAudioTTS:
                 prompt_wav_tokens,
             )
 
-            output_ids = self._generate(token_ids, max_tokens=8192 - len(token_ids))
+            output_ids = self._generate(token_ids, max_tokens=self._token_budget(token_ids))
             logger.debug("Voice cloning generation completed")
             vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
             return (
@@ -214,7 +222,7 @@ class StepAudioTTS:
             logger.debug(f"Edit instruction: {instruct_prefix}")
             logger.debug(f"Encoded prompt length: {len(prompt_tokens)}")
 
-            output_ids = self._generate(prompt_tokens, max_tokens=8192 - len(prompt_tokens))
+            output_ids = self._generate(prompt_tokens, max_tokens=self._token_budget(prompt_tokens))
             vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
             logger.debug("Audio editing generation completed")
             return (
@@ -261,6 +269,11 @@ class StepAudioTTS:
                 detail=f"Unsupported edit_type: {edit_type}",
             )
         return instruct_prefix
+
+    def _token_budget(self, token_ids: list[int]) -> int:
+        """What is left of the context, capped by max_new_tokens if set."""
+        budget = 8192 - len(token_ids)
+        return min(budget, self.max_new_tokens) if self.max_new_tokens else budget
 
     def _generate(self, token_ids: list[int], max_tokens: int = 4096, temperature: float = 0.7) -> torch.Tensor:
         """
