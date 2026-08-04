@@ -323,7 +323,11 @@ class StepAudioTTS:
             {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"}
         ]
 
-        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        # return_dict defaults to True from transformers 4.56 (5.14 in the Spark
+        # container), and a BatchEncoding iterates over its keys, not the ids
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        )
 
 
     def _encode_audio_edit_clone_prompt(
@@ -340,7 +344,10 @@ class StepAudioTTS:
             {"role": "user", "content": f"{text}"}
         ]
 
-        return self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        # see _encode_audio_edit_prompt: without this we get a BatchEncoding
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        )
 
 
     def detect_instruction_name(self, text):
