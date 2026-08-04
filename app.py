@@ -17,6 +17,11 @@ from tts import StepAudioTTS
 from model_loader import ModelSource
 from config.edit_config import get_supported_edit_types
 from whisper_wrapper import WhisperWrapper
+from spark_runtime import install_audio_compat
+
+# torchaudio's TorchCodec I/O aborts the process on this container, see
+# spark_runtime.install_audio_compat.
+install_audio_compat()
 
 # Configure logging
 logger = logging.getLogger(__name__)
