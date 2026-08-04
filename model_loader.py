@@ -138,6 +138,8 @@ class UnifiedModelLoader:
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "dtype": dtype,
                 "enforce_eager": enforce_eager,
+                # Step1 uses ALiBi sqrt, unsupported by FlashAttention.
+                "attention_backend": "TRITON_ATTN",
             }
 
             if quantization:

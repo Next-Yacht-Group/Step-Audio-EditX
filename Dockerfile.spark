@@ -1,0 +1,74 @@
+FROM nvcr.io/nvidia/vllm:26.04-py3
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/models/.cache/huggingface \
+    TRANSFORMERS_CACHE=/models/.cache/huggingface \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ffmpeg \
+    git \
+    git-lfs \
+    libsndfile1 \
+    libsndfile1-dev \
+    libsox-dev \
+    sox \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.spark.txt /tmp/requirements.spark.txt
+
+# Mantiene NumPy, PyTorch, vLLM e setuptools nelle versioni NVIDIA.
+RUN python3 -m pip install --no-cache-dir \
+    -r /tmp/requirements.spark.txt
+
+# ONNX Runtime GPU CUDA 13 per Linux ARM64.
+RUN python3 -m pip uninstall -y \
+    onnxruntime onnxruntime-gpu || true
+
+RUN python3 -m pip install --no-cache-dir \
+    coloredlogs flatbuffers packaging protobuf sympy \
+ && python3 -m pip install --no-cache-dir --pre --no-deps \
+    --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ \
+    onnxruntime-gpu
+
+
+# TorchAudio installato indirettamente da pip è compilato per CUDA 13.0,
+# mentre il PyTorch NVIDIA del container usa CUDA 13.2.
+# Lo ricompiliamo contro il PyTorch già installato.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    ninja-build \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip uninstall -y torchaudio \
+    && git clone --depth 1 https://github.com/pytorch/audio.git /opt/torchaudio \
+    && cd /opt/torchaudio \
+    && PIP_CONSTRAINT=/dev/null \
+       USE_CUDA=0 \
+       BUILD_SOX=0 \
+       USE_FFMPEG=0 \
+       BUILD_RNNT=0 \
+       BUILD_CTC_DECODER=0 \
+       python3 -m pip install \
+           --no-cache-dir \
+           --no-deps \
+           --no-build-isolation \
+           -e .
+
+COPY . /app
+
+EXPOSE 7860
+
+CMD ["python3", "app.py", \
+     "--model-path", "/models/Step-Audio-EditX", \
+     "--tokenizer-path", "/models/Step-Audio-Tokenizer", \
+     "--model-source", "local", \
+     "--server-name", "0.0.0.0", \
+     "--server-port", "7860",
+     "--cosyvoice-dtype", "bfloat16",
+     "--no-cosyvoice-cuda-graph"]
