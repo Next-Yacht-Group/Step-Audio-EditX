@@ -66,7 +66,7 @@ class StepAudioTokenizer:
         ]
         session_option = onnxruntime.SessionOptions()
         session_option.graph_optimization_level = (
-            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
         )
         session_option.intra_op_num_threads = 1
         self.ort_session = onnxruntime.InferenceSession(
