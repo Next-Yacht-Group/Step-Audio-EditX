@@ -60,6 +60,19 @@ RUN python3 -m pip uninstall -y torchaudio \
            --no-build-isolation \
            -e .
 
+# Il container porta solo lo stub di cuFFT (13 KB, serve al linker), non la
+# libreria vera: qualunque FFT su GPU muore con "cuFFT error: unknown error 50".
+# Il frontend fbank di funasr ne fa una per ogni wav di riferimento, quindi senza
+# questo nessuna clonazione parte. Il pacchetto senza suffisso è quello CUDA 13, e
+# 12.2.0.46 è la versione che il container si aspetta (CUFFT_VERSION).
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    --extra-index-url https://pypi.nvidia.com \
+    nvidia-cufft==12.2.0.46 \
+ && ln -sf /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcufft.so.12 \
+           /usr/local/cuda/targets/sbsa-linux/lib/libcufft.so.12 \
+ && ldconfig \
+ && test "$(stat -c%s /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcufft.so.12)" -gt 100000000
+
 COPY . /app
 
 EXPOSE 7860

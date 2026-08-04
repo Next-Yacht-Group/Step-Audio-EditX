@@ -791,6 +791,64 @@ print(torchaudio.__version__)
 
 ---
 
+### `cuFFT error: unknown error 50` / `You are running using the stub version of cufft`
+
+Errore osservato durante la clonazione, dentro il frontend fbank di funasr:
+
+```text
+File ".../torchaudio/compliance/kaldi.py", line 616, in fbank
+  spectrum = torch.fft.rfft(strided_input).abs()
+RuntimeError: cuFFT error: unknown error 50
+```
+
+Causa:
+
+- il container NVIDIA vLLM include solo lo **stub** di cuFFT (13 KB, quello che
+  serve al linker), non la libreria vera da ~280 MB;
+- `CUDA_COMPONENT_LIST` dell'immagine infatti non elenca cufft;
+- vLLM non usa cuFFT, quindi il modello si carica e il problema salta fuori solo
+  alla prima inferenza audio.
+
+Soluzione (già nel `Dockerfile.spark`): installare la build sbsa vera e
+sostituire lo stub.
+
+```bash
+python3 -m pip install --no-deps --extra-index-url https://pypi.nvidia.com \
+  nvidia-cufft==12.2.0.46
+ln -sf /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcufft.so.12 \
+       /usr/local/cuda/targets/sbsa-linux/lib/libcufft.so.12
+ldconfig
+```
+
+Il pacchetto per CUDA 13 è `nvidia-cufft`, senza suffisso: `nvidia-cufft-cu13`
+su PyPI è solo un segnaposto da 1 KB e `nvidia-cufft-cu12` è la major sbagliata
+(soname `libcufft.so.11`).
+
+Verifica:
+
+```bash
+docker run --rm --gpus all step-audio-editx:spark \
+  python3 -c 'import torch; print(torch.fft.rfft(torch.randn(1024, device=0)).shape)'
+```
+
+---
+
+### `free(): invalid pointer` alla prima clonazione
+
+Il processo muore senza traceback appena si carica un wav.
+
+Causa:
+
+- torchaudio 2.11 inoltra `load()`/`save()` a TorchCodec, e il wheel aarch64 di
+  torchcodec fa doppia free del decoder contro l'ffmpeg di questo container;
+- è un abort nativo, non un'eccezione: nessun `try/except` lo intercetta.
+
+Soluzione (già nel repository): `spark_runtime.install_audio_compat()` rimappa
+`torchaudio.load`/`save` su libsndfile. Viene chiamata da `app.py` e da
+`spark_runtime.create_engine()`, quindi vale sia per la UI sia per i job headless.
+
+---
+
 ### `use_alibi_sqrt` non supportato da FLASH_ATTN
 
 Errore:
