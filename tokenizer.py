@@ -60,7 +60,8 @@ class StepAudioTokenizer:
                 "CUDAExecutionProvider",
                 {
                     "cudnn_conv1d_pad_to_nc1d": "1",
-                    "cudnn_conv_algo_search": "DEFAULT",
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "1",
                 },
             )
         ]
