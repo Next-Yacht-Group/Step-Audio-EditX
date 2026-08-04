@@ -64,6 +64,10 @@ class StepAudioTokenizer:
         self.ort_session = onnxruntime.InferenceSession(
             cosy_tokenizer_path, sess_options=session_option, providers=providers
         )
+        # kept for the CPU fallback in _run_speech_tokenizer
+        self._speech_tokenizer_path = cosy_tokenizer_path
+        self._speech_tokenizer_options = session_option
+        self._speech_tokenizer_on_cpu = False
         self.chunk_size = [0, 4, 5]
         self.encoder_chunk_look_back = 4
         self.decoder_chunk_look_back = 1
@@ -170,24 +174,38 @@ class StepAudioTokenizer:
                 feat = whisper.log_mel_spectrogram(chunk, n_mels=128)
                 feat = feat.unsqueeze(0)
                 feat_len = np.array([feat.shape[2]], dtype=np.int32)
-                chunk_token = (
-                    self.ort_session.run(
-                        None,
-                        {
-                            self.ort_session.get_inputs()[0]
-                            .name: feat.detach()
-                            .cpu()
-                            .numpy(),
-                            self.ort_session.get_inputs()[1].name: feat_len,
-                        },
-                    )[0]
-                    .flatten()
-                    .tolist()
-                )
+                chunk_token = self._run_speech_tokenizer(feat, feat_len).flatten().tolist()
                 assert abs(len(chunk_token) - duration * 25) <= 2
                 speech_tokens += chunk_token
 
             return speech_tokens
+
+    def _run_speech_tokenizer(self, feat, feat_len):
+        """Run speech_tokenizer_v1, dropping the session to CPU if the GPU can't.
+
+        A CUDA session builds fine on hardware that cannot actually execute this
+        graph — on DGX Spark cuDNN fails on the very first Conv with
+        CUDNN_STATUS_INTERNAL_ERROR, whatever cudnn_conv_algo_search is set to — so
+        the only way to know is to run it. On CPU this model costs ~0.5s per clip,
+        which is small next to the LLM pass.
+        """
+        feed = {
+            self.ort_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
+            self.ort_session.get_inputs()[1].name: feat_len,
+        }
+        try:
+            return self.ort_session.run(None, feed)[0]
+        except Exception as e:
+            if self._speech_tokenizer_on_cpu:
+                raise
+            print(f"⚠️  speech tokenizer failed on GPU, retrying on CPU: {str(e)[:160]}")
+            self.ort_session = onnxruntime.InferenceSession(
+                self._speech_tokenizer_path,
+                sess_options=self._speech_tokenizer_options,
+                providers=["CPUExecutionProvider"],
+            )
+            self._speech_tokenizer_on_cpu = True
+            return self.ort_session.run(None, feed)[0]
 
     def kmean_cluster(self, samples, means):
         dists = torch.cdist(samples, means)
