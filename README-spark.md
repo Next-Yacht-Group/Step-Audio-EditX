@@ -671,6 +671,25 @@ We must use the spawn multiprocessing start method
 
 È atteso quando CUDA è già stata inizializzata nel processo principale.
 
+### `CUDNN failure 4000` nel tokenizer ONNX
+
+Messaggio:
+
+```text
+CUDNN failure 4000: CUDNN_STATUS_INTERNAL_ERROR ... expr=cudnnAddTensor(...)
+⚠️  speech tokenizer failed on GPU, retrying on CPU
+```
+
+**È innocuo.** cuDNN sul GB10 non riesce a eseguire la prima `Conv` di
+`speech_tokenizer_v1.onnx` — con `cudnn_conv1d_pad_to_nc1d`, con
+`cudnn_conv_algo_search` a `DEFAULT` o `HEURISTIC`, e con le ottimizzazioni del
+grafo disattivate, il risultato non cambia. Il fallback su CPU costa ~0.5s per
+clip ed è **numericamente equivalente**: ri-tokenizzare un wav di riferimento e
+rimandare gli stessi codici al vocoder ricostruisce la frase in modo
+perfettamente intelligibile.
+
+Non è la causa dell'audio incomprensibile. Chi la insegue perde tempo.
+
 ---
 
 ## 15. Troubleshooting

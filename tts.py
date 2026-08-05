@@ -20,6 +20,13 @@ from vllm import SamplingParams
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# The audio block: 1024 vq02 codes then 4096 vq06 codes, all single tokens in a
+# 74752-entry vocabulary. The debug logging below calls everything from 67584 up
+# "other", which is wrong — that is still vq06 — but it is left alone so the
+# numbers stay comparable with older logs.
+AUDIO_LO = 65536
+AUDIO_HI = 65536 + 1024 + 4096 - 1
+
 class HTTPException(Exception):
     """Custom HTTP exception for API errors"""
     def __init__(self, status_code, detail):
@@ -149,6 +156,7 @@ class StepAudioTTS:
         # System prompts
         self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
         self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
+        self.audio_start_id = self.tokenizer.convert_tokens_to_ids("<audio_start>")
 
     def clone(
         self,
@@ -338,48 +346,62 @@ class StepAudioTTS:
             logger.info(f"Generated {len(output_token_ids)} tokens: min={min_tok}, max={max_tok}, "
                        f"audio(65536-67583)={audio_count}, text(<65536)={text_count}, other(>=67584)={other_count}")
         
-        # Remove eos token if present
-        if len(output_token_ids) > 0 and output_token_ids[-1] == 3: # <|EOT|>
-            output_token_ids = output_token_ids[:-1]
-        
+        # Only the audio block means anything to the vocoder. The caller does
+        # `output_ids - 65536` and hands the result to token2wav, which reads it
+        # as a strict [vq02, vq02, vq06, vq06, vq06] cycle — one stray token (an
+        # <|EOT|>, an <audio_end>, a word the model decided to write) shifts the
+        # phase of everything after it and the rest of the clip is noise.
+        output_token_ids = [t for t in output_token_ids if AUDIO_LO <= t <= AUDIO_HI]
+
         output_ids = torch.tensor(output_token_ids, dtype=torch.long)
 
         return output_ids
+
+    def _encode(self, messages: list[dict]) -> list[int]:
+        """Chat template, then open the answer with `<audio_start>`.
+
+        The generation prompt ends `<|BOT|> assistant\\n`, and left there the
+        model reads it aloud: measured takes come back as "assistant.", or the
+        right words followed by it. `<audio_start>` is in the tokenizer (id 31)
+        alongside `<audio_end>`, `<text_start>` and `<text_end>`, and none of the
+        inference code used any of them. Prefilling it says "codes now, not
+        words" and on the repo's own demo prompt it moves the wakeword hit rate
+        from 1 take in 6 to 5 in 6.
+
+        return_dict=False because from transformers 4.56 (5.14 in the Spark
+        container) it defaults to True, and a BatchEncoding iterates over its
+        keys rather than the ids.
+        """
+        ids = self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        )
+        return list(ids) + [self.audio_start_id]
 
     def _encode_audio_edit_prompt(
         self, sys_prompt: str, instruct_prefix: str, audio_token_str: str
     ) -> list[int]:
         """Encode audio edit prompt to token sequence"""
-        messages = [
+        return self._encode([
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"}
-        ]
-
-        # return_dict defaults to True from transformers 4.56 (5.14 in the Spark
-        # container), and a BatchEncoding iterates over its keys, not the ids
-        return self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_dict=False
-        )
+        ])
 
 
     def _encode_audio_edit_clone_prompt(
         self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str
     ):
-        
+
         sys_prompt = self.edit_clone_sys_prompt_tpl.format(
             speaker=prompt_speaker,
             prompt_text=prompt_text,
             prompt_wav_tokens=prompt_wav_tokens
         )
-        messages = [
+        # the text to speak is marked, so the model can tell it apart from the
+        # transcript and the role tag either side of it
+        return self._encode([
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"{text}"}
-        ]
-
-        # see _encode_audio_edit_prompt: without this we get a BatchEncoding
-        return self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_dict=False
-        )
+            {"role": "user", "content": f"<text_start>{text}<text_end>"}
+        ])
 
 
     def detect_instruction_name(self, text):
