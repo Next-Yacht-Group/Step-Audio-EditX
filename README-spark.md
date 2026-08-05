@@ -671,6 +671,31 @@ We must use the spawn multiprocessing start method
 
 È atteso quando CUDA è già stata inizializzata nel processo principale.
 
+### L'audio esce incomprensibile, o dice "assistant"
+
+Se le clip generate non dicono il testo richiesto — dicono "assistant", "Thank
+you.", silenzio, o parlato senza senso — il problema **non** è nel tokenizer né
+nel vocoder. Verificato: ri-tokenizzare un wav di riferimento e rimandare gli
+stessi codici a `token2wav_nonstream` ricostruisce la frase in modo perfettamente
+intelligibile, e il teacher forcing dà perplexity 1.0 sulla continuazione vera
+contro 33 su quella di un'altra voce (quindi anche l'attenzione ALiBi-sqrt sul
+backend Triton è corretta).
+
+Erano due cose nel prompt, entrambe corrette in `tts.py`:
+
+1. `_generate` passava a vLLM solo `temperature`, quindi `top_p=1.0` e
+   `top_k=-1`: campionamento dall'intero vocabolario da 74752 token con la coda
+   viva. Il codice di training del repo chiede `top_p` 0.9.
+2. Il prompt di generazione finisce con `<|BOT|> assistant\n` e il modello lo
+   legge ad alta voce. Il tokenizer contiene `<audio_start>` (31), `<audio_end>`,
+   `<text_start>`, `<text_end>` e nessun percorso di inferenza li usava. Aprendo
+   il turno assistant con `<audio_start>` e marcando il testo da pronunciare con
+   `<text_start>`/`<text_end>`, sul prompt demo del repo la resa passa da 1 take
+   su 6 a 5 su 6.
+
+Restano circa metà dei take buoni con "assistant" appiccicato in fondo: vanno
+scartati a valle, trascrivendoli.
+
 ### `CUDNN failure 4000` nel tokenizer ONNX
 
 Messaggio:
@@ -689,6 +714,26 @@ rimandare gli stessi codici al vocoder ricostruisce la frase in modo
 perfettamente intelligibile.
 
 Non è la causa dell'audio incomprensibile. Chi la insegue perde tempo.
+
+### `enforce_eager`: lasciarlo attivo
+
+Misurato il 5 agosto 2026, stesso prompt, 6 generazioni dopo warm-up:
+
+| | tok/s | caricamento |
+|---|---|---|
+| `enforce_eager=True` | 21.2 | 62.5s |
+| `enforce_eager=False` | 21.0 | 64.5s |
+
+Nessun guadagno. vLLM lo dice esplicitamente all'avvio:
+
+```text
+`torch.compile` is turned on, but the model /models/Step-Audio-EditX does not
+support it.
+```
+
+Quindi disattivare eager non abilita Inductor: restano solo i CUDA Graph, e con
+`max_num_seqs=1` (`cudagraph_capture_sizes: [1, 2]`) non c'è nulla da guadagnare.
+Meglio tenere `--enforce-eager`, che evita anche la fase di cattura dei grafi.
 
 ---
 
