@@ -41,6 +41,11 @@ ENGINE_KWARGS = dict(
     # with CUDA graphs on it dies with "GET was unable to find an engine"
     cosyvoice_dtype="float32",
     cosyvoice_cuda_graph=False,
+    # vLLM's own defaults are no truncation at all: every step samples from the
+    # whole 74752-token vocabulary with the tail live. The repo's training code
+    # asks for 0.9 (`src/utils/reward_func_r1.py`), and unfiltered sampling is
+    # survivable only on prompts the model can copy rather than synthesize.
+    top_p=0.9,
 )
 
 

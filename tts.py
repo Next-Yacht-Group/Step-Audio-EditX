@@ -51,7 +51,11 @@ class StepAudioTTS:
         max_num_batched_tokens=None,
         cosyvoice_dtype="float32",
         cosyvoice_cuda_graph=True,
-        max_new_tokens=None
+        max_new_tokens=None,
+        top_p=1.0,
+        top_k=-1,
+        repetition_penalty=1.0,
+        extra_llm_kwargs=None
     ):
         """
         Initialize StepAudioTTS with vLLM
@@ -78,10 +82,21 @@ class StepAudioTTS:
                 rather see a truncated take it can reject cheaply than pay for a
                 full-context generation of speech it is going to throw away.
                 Audio runs at roughly 42 tokens per second.
+            top_p, top_k, repetition_penalty: sampling truncation. The defaults
+                here are vLLM's, which is to say none at all — every step samples
+                from the whole 74752-token vocabulary with the tail live. That
+                survives a prompt the model can copy, and falls apart on one it
+                has to synthesize. The repo's own training code asks for top_p
+                0.9 (`src/utils/reward_func_r1.py`), so prefer that.
+            extra_llm_kwargs: passed straight through to `vllm.LLM(...)`, for
+                settings this wrapper has no opinion about.
         """
         if tts_model_id is None:
             tts_model_id = model_path
         self.max_new_tokens = max_new_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
 
         logger.info("🔧 StepAudioTTS loading configuration:")
         logger.info(f"   - model_source: {model_source}")
@@ -107,6 +122,7 @@ class StepAudioTTS:
                 kv_cache_dtype=kv_cache_dtype,
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
+                **(extra_llm_kwargs or {}),
             )
             logger.info(f"✅ Successfully loaded vLLM model: {tts_model_id}")
         except Exception as e:
@@ -297,6 +313,9 @@ class StepAudioTTS:
         
         sampling_params = SamplingParams(
             temperature=temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
             max_tokens=max_tokens,
             skip_special_tokens=False,
         )
