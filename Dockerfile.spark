@@ -1,9 +1,17 @@
 FROM nvcr.io/nvidia/vllm:26.04-py3
 
+# HF_HOME has to be writable: transformers creates its dynamic-module cache
+# there the first time it loads a trust_remote_code model, and /models is a
+# read-only bind mount in every documented run command, so pointing it inside
+# there fails with "Read-only file system: '/models/.cache'" before the engine
+# even starts. Nothing here downloads from the hub — the weights are local — so
+# it only needs somewhere to write.
+# TRANSFORMERS_CACHE is gone in transformers 5.x; HF_HOME covers it.
 ENV DEBIAN_FRONTEND=noninteractive \
-    HF_HOME=/models/.cache/huggingface \
-    TRANSFORMERS_CACHE=/models/.cache/huggingface \
+    HF_HOME=/cache/huggingface \
     PYTHONUNBUFFERED=1
+
+RUN mkdir -p /cache/huggingface
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
