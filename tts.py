@@ -175,6 +175,30 @@ class StepAudioTTS:
         Returns:
             Tuple[torch.Tensor, int]: Generated audio tensor and sample rate
         """
+        return self.clone_takes(prompt_wav_path, prompt_text, target_text)[0]
+
+    def clone_takes(
+        self,
+        prompt_wav_path: str,
+        prompt_text: str,
+        target_text: str,
+        n: int = 1,
+        min_tokens: int = 0,
+        drop_runaways: bool = False,
+    ) -> list[Tuple[torch.Tensor, int]]:
+        """`clone`, but `n` independent takes off one prefill.
+
+        A caller that judges takes and resamples the bad ones — and for a short
+        target text most of them are bad — otherwise pays for the whole prompt
+        again on every attempt, and the prompt is the expensive part: several
+        hundred tokens of reference audio codes against a hundred or so
+        generated. vLLM samples n continuations from a single prefill, and on
+        this GPU decoding four sequences costs about what decoding one does.
+
+        Takes shorter than `min_tokens` or long enough to have hit the ceiling
+        are dropped before the vocoder runs: those are the near-silent stub and
+        the runaway, and no caller wants either. May return an empty list.
+        """
         try:
             logger.debug(f"Starting voice cloning: {prompt_wav_path}")
             vq0206_codes, vq02_codes_ori, vq06_codes_ori, speech_feat, _, speech_embedding = (
@@ -191,18 +215,9 @@ class StepAudioTTS:
                 prompt_speaker,
                 prompt_wav_tokens,
             )
-
-            output_ids = self._generate(token_ids, max_tokens=self._token_budget(token_ids))
-            logger.debug("Voice cloning generation completed")
-            vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
-            return (
-                self.cosy_model.token2wav_nonstream(
-                    output_ids - 65536,
-                    vq0206_codes_vocoder,
-                    speech_feat.to(torch.bfloat16),
-                    speech_embedding.to(torch.bfloat16),
-                ),
-                24000,
+            return self._vocode_takes(
+                token_ids, vq0206_codes, speech_feat, speech_embedding,
+                n, min_tokens, drop_runaways,
             )
         except Exception as e:
             logger.error(f"Clone failed: {e}")
@@ -229,6 +244,22 @@ class StepAudioTTS:
         Returns:
             Tuple[torch.Tensor, int]: Edited audio tensor and sample rate
         """
+        return self.edit_takes(
+            prompt_wav_path, prompt_text, edit_type, edit_info, target_text
+        )[0]
+
+    def edit_takes(
+        self,
+        prompt_wav_path: str,
+        prompt_text: str,
+        edit_type: str,
+        edit_info: Optional[str] = None,
+        target_text: Optional[str] = None,
+        n: int = 1,
+        min_tokens: int = 0,
+        drop_runaways: bool = False,
+    ) -> list[Tuple[torch.Tensor, int]]:
+        """`edit`, but `n` independent takes off one prefill. See `clone_takes`."""
         try:
             logger.debug(f"Starting audio editing: {edit_type} - {edit_info}")
             vq0206_codes, vq02_codes_ori, vq06_codes_ori, speech_feat, _, speech_embedding = (
@@ -246,10 +277,37 @@ class StepAudioTTS:
             logger.debug(f"Edit instruction: {instruct_prefix}")
             logger.debug(f"Encoded prompt length: {len(prompt_tokens)}")
 
-            output_ids = self._generate(prompt_tokens, max_tokens=self._token_budget(prompt_tokens))
-            vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
-            logger.debug("Audio editing generation completed")
-            return (
+            return self._vocode_takes(
+                prompt_tokens, vq0206_codes, speech_feat, speech_embedding,
+                n, min_tokens, drop_runaways,
+            )
+        except Exception as e:
+            logger.error(f"Edit failed: {e}")
+            raise
+
+    def _vocode_takes(
+        self,
+        token_ids: list[int],
+        prompt_codes: list[int],
+        speech_feat: torch.Tensor,
+        speech_embedding: torch.Tensor,
+        n: int,
+        min_tokens: int,
+        drop_runaways: bool,
+    ) -> list[Tuple[torch.Tensor, int]]:
+        """Sample n takes off one prefill, vocode the ones worth hearing."""
+        budget = self._token_budget(token_ids)
+        takes = self._generate_many(token_ids, max_tokens=budget, n=n)
+        vq0206_codes_vocoder = torch.tensor([prompt_codes], dtype=torch.long) - 65536
+
+        out = []
+        for output_ids, hit_ceiling in takes:
+            # a take that never stopped is a runaway and one below the floor is a
+            # near-silent stub; the vocoder is the expensive half, so decide first
+            if (drop_runaways and hit_ceiling) or len(output_ids) < min_tokens:
+                logger.debug(f"take dropped before the vocoder: {len(output_ids)} tokens")
+                continue
+            out.append((
                 self.cosy_model.token2wav_nonstream(
                     output_ids - 65536,
                     vq0206_codes_vocoder,
@@ -257,10 +315,8 @@ class StepAudioTTS:
                     speech_embedding.to(torch.bfloat16),
                 ),
                 24000,
-            )
-        except Exception as e:
-            logger.error(f"Edit failed: {e}")
-            raise
+            ))
+        return out
 
     def _build_audio_edit_instruction(
         self,
@@ -300,16 +356,35 @@ class StepAudioTTS:
         return min(budget, self.max_new_tokens) if self.max_new_tokens else budget
 
     def _generate(self, token_ids: list[int], max_tokens: int = 4096, temperature: float = 0.7) -> torch.Tensor:
+        """One take's tokens. See `_generate_many`."""
+        return self._generate_many(token_ids, max_tokens, temperature, n=1)[0][0]
+
+    def _generate_many(
+        self,
+        token_ids: list[int],
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        n: int = 1,
+    ) -> list[Tuple[torch.Tensor, bool]]:
         """
-        Generate output tokens using vLLM
+        Generate n independent takes from one prefill, using vLLM
 
         Args:
             token_ids: Input token IDs (including audio tokens 65536+)
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            n: How many takes to sample. They share the prefill, which for this
+                model is most of the work — the prompt carries several hundred
+                tokens of reference audio codes against a hundred or so
+                generated — and decoding a handful of sequences side by side
+                costs little more than decoding one.
 
         Returns:
-            torch.Tensor: Generated token IDs (only the generated part, not input)
+            list[Tuple[torch.Tensor, bool]]: per take, its generated token IDs
+                (not the input) and whether it ran into `max_tokens` instead of
+                stopping on its own — which is how a runaway announces itself.
+                The token count can't be used for that, because the ids have had
+                everything outside the audio block dropped by then.
         """
         # Debug: analyze INPUT token distribution
         audio_in = sum(1 for t in token_ids if 65536 <= t < 67584)
@@ -320,6 +395,7 @@ class StepAudioTTS:
             logger.info(f"INPUT range: min={min(token_ids)}, max={max(token_ids)}")
         
         sampling_params = SamplingParams(
+            n=n,
             temperature=temperature,
             top_p=self.top_p,
             top_k=self.top_k,
@@ -327,35 +403,39 @@ class StepAudioTTS:
             max_tokens=max_tokens,
             skip_special_tokens=False,
         )
-        
+
         # Use prompt_token_ids directly instead of decoding to text
         # This preserves audio tokens (65536+) which would be corrupted by decode
         prompt = {"prompt_token_ids": token_ids}
         outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
 
-        # Extract output token IDs (vLLM only returns generated tokens, not input)
-        output_token_ids = list(outputs[0].outputs[0].token_ids)
-        
-        # Debug: analyze token distribution
-        if output_token_ids:
-            min_tok = min(output_token_ids)
-            max_tok = max(output_token_ids)
-            audio_count = sum(1 for t in output_token_ids if 65536 <= t < 67584)
-            text_count = sum(1 for t in output_token_ids if t < 65536)
-            other_count = sum(1 for t in output_token_ids if t >= 67584)
-            logger.info(f"Generated {len(output_token_ids)} tokens: min={min_tok}, max={max_tok}, "
-                       f"audio(65536-67583)={audio_count}, text(<65536)={text_count}, other(>=67584)={other_count}")
-        
-        # Only the audio block means anything to the vocoder. The caller does
-        # `output_ids - 65536` and hands the result to token2wav, which reads it
-        # as a strict [vq02, vq02, vq06, vq06, vq06] cycle — one stray token (an
-        # <|EOT|>, an <audio_end>, a word the model decided to write) shifts the
-        # phase of everything after it and the rest of the clip is noise.
-        output_token_ids = [t for t in output_token_ids if AUDIO_LO <= t <= AUDIO_HI]
+        takes = []
+        # vLLM only returns generated tokens, not input
+        for completion in outputs[0].outputs:
+            output_token_ids = list(completion.token_ids)
 
-        output_ids = torch.tensor(output_token_ids, dtype=torch.long)
+            # Debug: analyze token distribution
+            if output_token_ids:
+                min_tok = min(output_token_ids)
+                max_tok = max(output_token_ids)
+                audio_count = sum(1 for t in output_token_ids if 65536 <= t < 67584)
+                text_count = sum(1 for t in output_token_ids if t < 65536)
+                other_count = sum(1 for t in output_token_ids if t >= 67584)
+                logger.info(f"Generated {len(output_token_ids)} tokens: min={min_tok}, max={max_tok}, "
+                           f"audio(65536-67583)={audio_count}, text(<65536)={text_count}, other(>=67584)={other_count}")
 
-        return output_ids
+            # Only the audio block means anything to the vocoder. The caller does
+            # `output_ids - 65536` and hands the result to token2wav, which reads it
+            # as a strict [vq02, vq02, vq06, vq06, vq06] cycle — one stray token (an
+            # <|EOT|>, an <audio_end>, a word the model decided to write) shifts the
+            # phase of everything after it and the rest of the clip is noise.
+            output_token_ids = [t for t in output_token_ids if AUDIO_LO <= t <= AUDIO_HI]
+            takes.append((
+                torch.tensor(output_token_ids, dtype=torch.long),
+                completion.finish_reason == "length",
+            ))
+
+        return takes
 
     def _encode(self, messages: list[dict]) -> list[int]:
         """Chat template, then open the answer with `<audio_start>`.

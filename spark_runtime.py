@@ -33,7 +33,9 @@ ENGINE_KWARGS = dict(
     # concurrent requests we will never issue
     gpu_memory_utilization=0.20,
     max_model_len=3072,
-    max_num_seqs=1,
+    # enough for a caller sampling a handful of takes off one prefill
+    # (`StepAudioTTS.clone_takes`), not enough to matter to the KV cache
+    max_num_seqs=8,
     # no Inductor, no vLLM CUDA graphs — both misbehave here
     enforce_eager=True,
     dtype="bfloat16",
